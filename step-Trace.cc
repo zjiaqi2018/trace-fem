@@ -17,6 +17,7 @@
 // @sect3{Include files}
 
 // The first include files have all been treated in previous examples.
+// #define USE_TRILINOS
 
 #include <deal.II/base/function.h>
 
@@ -55,6 +56,17 @@
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/sparse_ilu.h>
 
+#ifdef USE_TRILINOS
+#  include <deal.II/lac/block_sparsity_pattern.h>
+#  include <deal.II/lac/sparsity_tools.h>
+#  include <deal.II/lac/trilinos_block_sparse_matrix.h>
+#  include <deal.II/lac/trilinos_parallel_block_vector.h>
+#  include <deal.II/lac/trilinos_precondition.h>
+#  include <deal.II/lac/trilinos_solver.h>
+#  include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/base/utilities.h>
+#endif
+
 #include <deal.II/lac/sparse_direct.h>
 
 
@@ -89,6 +101,14 @@ namespace StepTrace
     void run();
 
   private:
+#ifdef USE_TRILINOS
+  using VectorType = TrilinosWrappers::MPI::Vector;
+  using MatrixType = TrilinosWrappers::SparseMatrix;
+#else 
+    using VectorType = Vector<double>;
+  using MatrixType = SparseMatrix<double> ;  
+#endif
+  
     void make_grid();
 
     void setup_discrete_level_set();
@@ -120,19 +140,19 @@ namespace StepTrace
     // discrete level set function that describes the geometry of the domain.
     const FE_Q<dim> fe_level_set;
     DoFHandler<dim> level_set_dof_handler;
-    Vector<double>  level_set;
+    VectorType  level_set;
 
     // The second DoFHandler manages the DoFs for the solution of the Poisson
     // equation.
     hp::FECollection<dim> fe_collection;
     DoFHandler<dim>       dof_handler;
-    Vector<double>        solution;
+    VectorType        solution;
 
     NonMatching::MeshClassifier<dim> mesh_classifier;
 
     SparsityPattern      sparsity_pattern;
-    SparseMatrix<double> stiffness_matrix;
-    Vector<double>       rhs;
+    MatrixType stiffness_matrix;
+    VectorType       rhs;
   };
 
 template <int dim>
@@ -190,12 +210,33 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     std::cout << "Setting up discrete level set function" << std::endl;
 
     level_set_dof_handler.distribute_dofs(fe_level_set);
-    level_set.reinit(level_set_dof_handler.n_dofs());
 
-    const Functions::SignedDistance::Sphere<dim> signed_distance_sphere;
+    std::cout<<" level set number of dofs: "<<level_set_dof_handler.n_dofs()<<std::endl;
+    const Functions::SignedDistance::Sphere<dim> signed_distance_sphere;    
+
+#ifdef USE_TRILINOS
+    IndexSet level_set_locally_relevant_dofs;
+    DoFTools::extract_locally_relevant_dofs(level_set_dof_handler, level_set_locally_relevant_dofs);
+
+    VectorType tmp_sol;
+    tmp_sol.reinit(level_set_dof_handler.locally_owned_dofs(),
+                  MPI_COMM_WORLD);
+
+    VectorTools::interpolate(level_set_dof_handler,
+                             signed_distance_sphere,
+                             tmp_sol);
+
+    level_set.reinit(level_set_locally_relevant_dofs,
+                     level_set_dof_handler.locally_owned_dofs(),
+                     MPI_COMM_WORLD);
+    level_set = tmp_sol;
+
+#else
+    level_set.reinit(level_set_dof_handler.n_dofs());
     VectorTools::interpolate(level_set_dof_handler,
                              signed_distance_sphere,
                              level_set);
+#endif
   }
 
 
@@ -221,7 +262,10 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     fe_collection.push_back(FE_Q<dim>(fe_degree));
     fe_collection.push_back(FE_Nothing<dim>());
 
+    std::cout<<" number of dofs: "<<dof_handler.n_dofs()<<std::endl;
+
     for (const auto &cell : dof_handler.active_cell_iterators())
+      if(cell->is_locally_owned())
       {
         const NonMatching::LocationToLevelSet cell_location =
           mesh_classifier.location_to_level_set(cell);
@@ -282,11 +326,24 @@ double RightHandSide<dim>::value(const Point<dim> &p,
                                          face_coupling,
                                          numbers::invalid_subdomain_id,
                                          face_has_flux_coupling);
+#ifdef USE_TRILINOS
+    IndexSet locally_relevant_dofs;
+    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+    IndexSet locally_owned_dofs = dof_handler.locally_owned_dofs();
+    SparsityTools::distribute_sparsity_pattern(dsp,
+                                               locally_owned_dofs,
+                                               MPI_COMM_WORLD,
+                                               locally_relevant_dofs);
+    stiffness_matrix.reinit(locally_owned_dofs, locally_owned_dofs, dsp, MPI_COMM_WORLD);
+    solution.reinit(locally_owned_dofs, MPI_COMM_WORLD);
+    rhs.reinit(locally_owned_dofs, MPI_COMM_WORLD);
+#else                                         
     sparsity_pattern.copy_from(dsp);
 
     stiffness_matrix.reinit(sparsity_pattern);
     solution.reinit(dof_handler.n_dofs());
     rhs.reinit(dof_handler.n_dofs());
+#endif
   }
 
 
@@ -403,220 +460,243 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     // As we iterate over the cells, we don't need to do anything on the cells
     // that have FENothing elements. To disregard them we use an iterator
     // filter.
-    for (const auto &cell :
-         dof_handler.active_cell_iterators() |
-           IteratorFilters::ActiveFEIndexEqualTo(ActiveFEIndex::lagrange))
-      {
-        local_stiffness = 0;
-        local_rhs       = 0;
+    for (const auto &cell : dof_handler.active_cell_iterators())
+      if (cell->is_locally_owned() &&
+          cell->active_fe_index() == ActiveFEIndex::lagrange)
+        {
+          local_stiffness = 0;
+          local_rhs       = 0;
 
-        const double cell_side_length = cell->minimum_vertex_distance();
+          const double cell_side_length = cell->minimum_vertex_distance();
 
-        // First, we call the reinit function of our NonMatching::FEValues
-        // object. In the background, NonMatching::FEValues uses the
-        // MeshClassifier passed to its constructor to check if the incoming
-        // cell is intersected. If that is the case, NonMatching::FEValues calls
-        // the NonMatching::QuadratureGenerator in the background to create the
-        // immersed quadrature rules.
-        non_matching_fe_values.reinit(cell);
+          // First, we call the reinit function of our NonMatching::FEValues
+          // object. In the background, NonMatching::FEValues uses the
+          // MeshClassifier passed to its constructor to check if the incoming
+          // cell is intersected. If that is the case, NonMatching::FEValues
+          // calls the NonMatching::QuadratureGenerator in the background to
+          // create the immersed quadrature rules.
+          non_matching_fe_values.reinit(cell);
 
-        // After calling reinit, we can retrieve a dealii::FEValues object with
-        // quadrature points that corresponds to integrating over the inside
-        // region of the cell. This is the object we use to do the local
-        // assembly. This is similar to how hp::FEValues builds dealii::FEValues
-        // objects. However, one difference here is that the dealii::FEValues
-        // object is returned as an optional. This is a type that wraps an
-        // object that may or may not be present. This requires us to add an
-        // if-statement to check if the returned optional contains a value,
-        // before we use it. This might seem odd at first. Why does the function
-        // not just return a reference to a const FEValues<dim>? The reason is
-        // that in an immersed method, we have essentially no control of how the
-        // cuts occur. Even if the cell is formally intersected: $T \cap \Omega
-        // \neq \emptyset$, it might be that the cut is only of floating point
-        // size $|T \cap \Omega| \sim \epsilon$. When this is the case, we can
-        // not expect that the algorithm that generates the quadrature rule
-        // produces anything useful. It can happen that the algorithm produces 0
-        // quadrature points. When this happens, the returned optional will not
-        // contain a value, even if the cell is formally intersected.
-        
+          // After calling reinit, we can retrieve a dealii::FEValues object
+          // with quadrature points that corresponds to integrating over the
+          // inside region of the cell. This is the object we use to do the
+          // local assembly. This is similar to how hp::FEValues builds
+          // dealii::FEValues objects. However, one difference here is that the
+          // dealii::FEValues object is returned as an optional. This is a type
+          // that wraps an object that may or may not be present. This requires
+          // us to add an if-statement to check if the returned optional
+          // contains a value, before we use it. This might seem odd at first.
+          // Why does the function not just return a reference to a const
+          // FEValues<dim>? The reason is that in an immersed method, we have
+          // essentially no control of how the cuts occur. Even if the cell is
+          // formally intersected: $T \cap \Omega \neq \emptyset$, it might be
+          // that the cut is only of floating point size $|T \cap \Omega| \sim
+          // \epsilon$. When this is the case, we can not expect that the
+          // algorithm that generates the quadrature rule produces anything
+          // useful. It can happen that the algorithm produces 0 quadrature
+          // points. When this happens, the returned optional will not contain a
+          // value, even if the cell is formally intersected.
+
+          /* TraceFEM:
         /* TraceFEM: 
-        const std_cxx17::optional<FEValues<dim>> &inside_fe_values =
-          non_matching_fe_values.get_inside_fe_values();
+          /* TraceFEM:
+          const std_cxx17::optional<FEValues<dim>> &inside_fe_values =
+            non_matching_fe_values.get_inside_fe_values();
 
-        if (inside_fe_values)
-          for (const unsigned int q :
-               inside_fe_values->quadrature_point_indices())
-            {
-              const Point<dim> &point = inside_fe_values->quadrature_point(q);
-              for (const unsigned int i : inside_fe_values->dof_indices())
-                {
-                  for (const unsigned int j : inside_fe_values->dof_indices())
-                    {
-                      local_stiffness(i, j) +=
-                        inside_fe_values->shape_grad(i, q) *
-                        inside_fe_values->shape_grad(j, q) *
-                        inside_fe_values->JxW(q);
-                    }
-                  local_rhs(i) += rhs_function.value(point) *
-                                  inside_fe_values->shape_value(i, q) *
-                                  inside_fe_values->JxW(q);
-                }
-            }
-	*/
-	
-	//TraceFEM: normal-gradient-over-volume stabilization...
-        /*const std_cxx17::optional<FEValues<dim>> &intersected_fe_values =
-         	non_matching_fe_values.get_intersected_fe_values(); //Doesn't exist!
-*/
-	const std_cxx17::optional<NonMatching::FEImmersedSurfaceValues<dim>>
-          &surface_fe_values = non_matching_fe_values.get_surface_fe_values();
-
-        if (surface_fe_values) {
-        	typename DoFHandler<dim>::active_cell_iterator level_set_cell(&(triangulation), cell->level(), cell->index(), &level_set_dof_handler); 
-          	fe_values.reinit(level_set_cell);
-	   	std::vector<Tensor<1, dim>> normal(quadrature_formula.size());
-           	fe_values.get_function_gradients(level_set, normal);		
-         
-          for (const unsigned int q :
-               fe_values.quadrature_point_indices())
-            {
-              const Point<dim> &point = fe_values.quadrature_point(q);
-              normal[q]=(1.0/normal[q].norm())*normal[q];
-              for (const unsigned int i : fe_values.dof_indices())
-                {
-                  for (const unsigned int j : fe_values.dof_indices())
-                    {
-                      local_stiffness(i, j) +=
-                        norm_grad_parameter * (normal[q] * fe_values.shape_grad(i, q)) * (normal[q] * fe_values.shape_grad(j, q))
-                        * fe_values.JxW(q);
-                    }
-                }
-            }
-         }
-        //...TraceFEM*/
-	
-        // In the same way, we can use NonMatching::FEValues to retrieve an
-        // FEFaceValues-like object to integrate over $T \cap \Gamma$. The only
-        // thing that is new here is the type of the object. The transformation
-        // from quadrature weights to JxW-values is different for surfaces, so
-        // we need a new class: NonMatching::FEImmersedSurfaceValues. In
-        // addition to the ordinary functions shape_value(..), shape_grad(..),
-        // etc., one can use its normal_vector(..)-function to get an outward
-        // normal to the immersed surface, $\Gamma$. In terms of the level set
-        // function, this normal reads
-        // @f{equation*}
-        //   n = \frac{\nabla \psi}{\| \nabla \psi \|}.
-        // @f}
-        // An additional benefit of std::optional is that we do not need any
-        // other check for whether we are on intersected cells: In case we are
-        // on an inside cell, we get an empty object here.
-       
-        /*const std_cxx17::optional<NonMatching::FEImmersedSurfaceValues<dim>>
-          &surface_fe_values = non_matching_fe_values.get_surface_fe_values();
-*/
-        if (surface_fe_values)
-          {
+          if (inside_fe_values)
             for (const unsigned int q :
-                 surface_fe_values->quadrature_point_indices())
+                 inside_fe_values->quadrature_point_indices())
               {
-                const Point<dim> &point =
-                  surface_fe_values->quadrature_point(q);
-                const Tensor<1, dim> &normal =
-                  surface_fe_values->normal_vector(q);
-                for (const unsigned int i : surface_fe_values->dof_indices())
+                const Point<dim> &point = inside_fe_values->quadrature_point(q);
+                for (const unsigned int i : inside_fe_values->dof_indices())
                   {
-                    for (const unsigned int j :
-                         surface_fe_values->dof_indices())
+                    for (const unsigned int j : inside_fe_values->dof_indices())
                       {
-                        local_stiffness(i, j) += (
-                          /*TraceFEM -normal * surface_fe_values->shape_grad(i, q) *
-                             surface_fe_values->shape_value(j, q) +
-                           -normal * surface_fe_values->shape_grad(j, q) *
-                             surface_fe_values->shape_value(i, q) +
-                           nitsche_parameter / cell_side_length * */
-                             surface_fe_values->shape_value(i, q) *
-                             surface_fe_values->shape_value(j, q)
-                             +
-                             (surface_fe_values->shape_grad(i, q)-(normal*surface_fe_values->shape_grad(i, q))*normal) *
-                             (surface_fe_values->shape_grad(j, q)-(normal*surface_fe_values->shape_grad(j, q))*normal) 
-                             ) *
-                          surface_fe_values->JxW(q);
-                          
+                        local_stiffness(i, j) +=
+                          inside_fe_values->shape_grad(i, q) *
+                          inside_fe_values->shape_grad(j, q) *
+                          inside_fe_values->JxW(q);
                       }
-                      
-                    local_rhs(i) += right_hand_side.value(point) *surface_fe_values->shape_value(i, q) * surface_fe_values->JxW(q);
-                    /*TraceFEM 
-                    local_rhs(i) +=
-                       boundary_condition.value(point) *
-                      (nitsche_parameter / cell_side_length *
-                         surface_fe_values->shape_value(i, q) -
-                       normal * surface_fe_values->shape_grad(i, q)) *
-                      surface_fe_values->JxW(q);*/
+                    local_rhs(i) += rhs_function.value(point) *
+                                    inside_fe_values->shape_value(i, q) *
+                                    inside_fe_values->JxW(q);
                   }
               }
-          }
+    */
 
-      
-        cell->get_dof_indices(local_dof_indices);
+          // TraceFEM: normal-gradient-over-volume stabilization...
+          /*const std_cxx17::optional<FEValues<dim>> &intersected_fe_values =
+            non_matching_fe_values.get_intersected_fe_values(); //Doesn't exist!
+  */
+          const std_cxx17::optional<NonMatching::FEImmersedSurfaceValues<dim>>
+            &surface_fe_values = non_matching_fe_values.get_surface_fe_values();
 
-        stiffness_matrix.add(local_dof_indices, local_stiffness);
-        rhs.add(local_dof_indices, local_rhs);
-
- 			
-        // The assembly of the ghost penalty term is straight forward. As we
-        // iterate over the local faces, we first check if the current face
-        // belongs to the set $\mathcal{F}_h$. The actual assembly is simple
-        // using FEInterfaceValues. Assembling in this we will traverse each
-        // internal face in the mesh twice, so in order to get the penalty
-        // constant we expect, we multiply the penalty term with a factor 1/2.
-        
-        for (unsigned int f : cell->face_indices())
-          if (face_has_ghost_penalty(cell, f))
+          if (surface_fe_values)
             {
-              const unsigned int invalid_subface =
-                numbers::invalid_unsigned_int;
+              typename DoFHandler<dim>::active_cell_iterator level_set_cell(
+                &(triangulation),
+                cell->level(),
+                cell->index(),
+                &level_set_dof_handler);
+              fe_values.reinit(level_set_cell);
+              std::vector<Tensor<1, dim>> normal(quadrature_formula.size());
+              fe_values.get_function_gradients(level_set, normal);
+           	fe_values.get_function_gradients(level_set, normal);		
+              fe_values.get_function_gradients(level_set, normal);
 
-
-              fe_interface_values.reinit(cell,
-                                         f,
-                                         invalid_subface,
-                                         cell->neighbor(f),
-                                         cell->neighbor_of_neighbor(f),
-                                         invalid_subface);
-
-              const unsigned int n_interface_dofs =
-                fe_interface_values.n_current_interface_dofs();
-              FullMatrix<double> local_stabilization(n_interface_dofs,
-                                                     n_interface_dofs);
-              for (unsigned int q = 0;
-                   q < fe_interface_values.n_quadrature_points;
-                   ++q)
+              for (const unsigned int q : fe_values.quadrature_point_indices())
                 {
-                  const Tensor<1, dim> normal = fe_interface_values.normal(q);
-                  for (unsigned int i = 0; i < n_interface_dofs; ++i)
-                    for (unsigned int j = 0; j < n_interface_dofs; ++j)
-                      {
-                        local_stabilization(i, j) +=
-                          .5 * ghost_parameter 
-                          //TraceFEM: * cell_side_length 
-                          * normal *
-                          fe_interface_values.jump_in_shape_gradients(i, q) *
-                          normal *
-                          fe_interface_values.jump_in_shape_gradients(j, q) *
-                          fe_interface_values.JxW(q);
-                      }
+                  const Point<dim> &point = fe_values.quadrature_point(q);
+                  normal[q] = (1.0 / normal[q].norm()) * normal[q];
+                  for (const unsigned int i : fe_values.dof_indices())
+                    {
+                      for (const unsigned int j : fe_values.dof_indices())
+                        {
+                          local_stiffness(i, j) +=
+                            norm_grad_parameter *
+                            (normal[q] * fe_values.shape_grad(i, q)) *
+                            (normal[q] * fe_values.shape_grad(j, q)) *
+                            fe_values.JxW(q);
+                        }
+                    }
                 }
-
-              const std::vector<types::global_dof_index>
-                local_interface_dof_indices =
-                  fe_interface_values.get_interface_dof_indices();
-
-              stiffness_matrix.add(local_interface_dof_indices,
-                                   local_stabilization);
             }
-            
-            
-      }
+          //...TraceFEM*/
+
+          // In the same way, we can use NonMatching::FEValues to retrieve an
+          // FEFaceValues-like object to integrate over $T \cap \Gamma$. The
+          // only thing that is new here is the type of the object. The
+          // transformation from quadrature weights to JxW-values is different
+          // for surfaces, so we need a new class:
+          // NonMatching::FEImmersedSurfaceValues. In addition to the ordinary
+          // functions shape_value(..), shape_grad(..), etc., one can use its
+          // normal_vector(..)-function to get an outward normal to the immersed
+          // surface, $\Gamma$. In terms of the level set function, this normal
+          // reads
+          // @f{equation*}
+          //   n = \frac{\nabla \psi}{\| \nabla \psi \|}.
+          // @f}
+          // An additional benefit of std::optional is that we do not need any
+          // other check for whether we are on intersected cells: In case we are
+          // on an inside cell, we get an empty object here.
+
+          /*const std_cxx17::optional<NonMatching::FEImmersedSurfaceValues<dim>>
+            &surface_fe_values = non_matching_fe_values.get_surface_fe_values();
+  */
+          if (surface_fe_values)
+            {
+              for (const unsigned int q :
+                   surface_fe_values->quadrature_point_indices())
+                {
+                  const Point<dim> &point =
+                    surface_fe_values->quadrature_point(q);
+                  const Tensor<1, dim> &normal =
+                    surface_fe_values->normal_vector(q);
+                  for (const unsigned int i : surface_fe_values->dof_indices())
+                    {
+                      for (const unsigned int j :
+                           surface_fe_values->dof_indices())
+                        {
+                          local_stiffness(i, j) +=
+                            (
+                              /*TraceFEM -normal *
+                               surface_fe_values->shape_grad(i, q) *
+                                 surface_fe_values->shape_value(j, q) +
+                               -normal * surface_fe_values->shape_grad(j, q) *
+                                 surface_fe_values->shape_value(i, q) +
+                               nitsche_parameter / cell_side_length * */
+                              surface_fe_values->shape_value(i, q) *
+                                surface_fe_values->shape_value(j, q) +
+                              (surface_fe_values->shape_grad(i, q) -
+                               (normal * surface_fe_values->shape_grad(i, q)) *
+                                 normal) *
+                                (surface_fe_values->shape_grad(j, q) -
+                                 (normal *
+                                  surface_fe_values->shape_grad(j, q)) *
+                                   normal)) *
+                            surface_fe_values->JxW(q);
+                        }
+
+                      local_rhs(i) += right_hand_side.value(point) *
+                                      surface_fe_values->shape_value(i, q) *
+                                      surface_fe_values->JxW(q);
+                      /*TraceFEM
+                    /*TraceFEM 
+                      /*TraceFEM
+                      local_rhs(i) +=
+                         boundary_condition.value(point) *
+                        (nitsche_parameter / cell_side_length *
+                           surface_fe_values->shape_value(i, q) -
+                         normal * surface_fe_values->shape_grad(i, q)) *
+                        surface_fe_values->JxW(q);*/
+                    }
+                }
+            }
+
+
+          cell->get_dof_indices(local_dof_indices);
+
+          stiffness_matrix.add(local_dof_indices, local_stiffness);
+          rhs.add(local_dof_indices, local_rhs);
+
+
+          // The assembly of the ghost penalty term is straight forward. As we
+          // iterate over the local faces, we first check if the current face
+          // belongs to the set $\mathcal{F}_h$. The actual assembly is simple
+          // using FEInterfaceValues. Assembling in this we will traverse each
+          // internal face in the mesh twice, so in order to get the penalty
+          // constant we expect, we multiply the penalty term with a factor 1/2.
+
+          for (unsigned int f : cell->face_indices())
+            if (face_has_ghost_penalty(cell, f))
+              {
+                const unsigned int invalid_subface =
+                  numbers::invalid_unsigned_int;
+
+
+                fe_interface_values.reinit(cell,
+                                           f,
+                                           invalid_subface,
+                                           cell->neighbor(f),
+                                           cell->neighbor_of_neighbor(f),
+                                           invalid_subface);
+
+                const unsigned int n_interface_dofs =
+                  fe_interface_values.n_current_interface_dofs();
+                FullMatrix<double> local_stabilization(n_interface_dofs,
+                                                       n_interface_dofs);
+                for (unsigned int q = 0;
+                     q < fe_interface_values.n_quadrature_points;
+                     ++q)
+                  {
+                    const Tensor<1, dim> normal = fe_interface_values.normal(q);
+                    for (unsigned int i = 0; i < n_interface_dofs; ++i)
+                      for (unsigned int j = 0; j < n_interface_dofs; ++j)
+                        {
+                          local_stabilization(i, j) +=
+                            .5 *
+                            ghost_parameter
+                            // TraceFEM: * cell_side_length
+                            * normal *
+                            fe_interface_values.jump_in_shape_gradients(i, q) *
+                            normal *
+                            fe_interface_values.jump_in_shape_gradients(j, q) *
+                            fe_interface_values.JxW(q);
+                        }
+                  }
+
+                const std::vector<types::global_dof_index>
+                  local_interface_dof_indices =
+                    fe_interface_values.get_interface_dof_indices();
+
+                stiffness_matrix.add(local_interface_dof_indices,
+                                     local_stabilization);
+              }
+        }
+#ifdef USE_TRILINOS        
+      stiffness_matrix.compress(VectorOperation::add);
+      rhs.compress(VectorOperation::add);
+#endif
   }
 
 
@@ -624,16 +704,22 @@ double RightHandSide<dim>::value(const Point<dim> &p,
   template <int dim>
   void LaplaceBeltramiSolver<dim>::solve()
   {
-    std::string flag="Non_Direct";
+    std::string flag="nonDirect";
     if (flag=="Direct")
     {	
     	std::cout << "Solving directly... ";
     	Timer timer;
- 
+#ifdef USE_TRILINOS      
+	    SolverControl                  solver_control(2000, 1e-8);
+            TrilinosWrappers::SolverDirect::AdditionalData data;
+            TrilinosWrappers::SolverDirect solver(solver_control, data);
+            solver.solve(stiffness_matrix, solution, rhs);
+#else
 	    SparseDirectUMFPACK A_direct;
 	    A_direct.initialize(stiffness_matrix);
 	 
 	    A_direct.vmult(solution, rhs);
+#endif      
  
 	    timer.stop();
 	    std::cout << "took (" << timer.cpu_time() << "s)" << std::endl;
@@ -641,14 +727,37 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     else
      {
 	    std::cout << "Solving system" << std::endl;
+#ifdef USE_TRILINOS
+	    const unsigned int max_iterations = solution.size();
+	    SolverControl      solver_control(max_iterations);
+      // copied from ASPECT
+      // Make the AMG preconditioner
+      std::vector<std::vector<bool>> constant_modes;
+      DoFTools::extract_constant_modes (dof_handler,
+                                        ComponentMask(),
+                                        constant_modes);      
+      TrilinosWrappers::PreconditionAMG                 preconditioner_stiffness;
+      TrilinosWrappers::PreconditionAMG::AdditionalData Amg_data;
+      Amg_data.constant_modes        = constant_modes;
+      Amg_data.elliptic              = true;
+      Amg_data.higher_order_elements = false;
+      Amg_data.smoother_sweeps       = 2;
+      Amg_data.aggregation_threshold = 0.02;
+      preconditioner_stiffness.initialize(stiffness_matrix);
 
+      SolverCG<VectorType> cg(solver_control);
+      cg.solve (stiffness_matrix, solution, rhs, preconditioner_stiffness);      
+      std::cout << "   Solving system... " << solver_control.last_step() <<" iterations."<< std::endl;      
+
+#else
 	    const unsigned int max_iterations = solution.size();
 	    SolverControl      solver_control(max_iterations);
 	    SolverCG<>         solver(solver_control);
 	    SparseILU<double> ILU;
 	    ILU.initialize(stiffness_matrix);
 	    solver.solve(stiffness_matrix, solution, rhs, ILU);
-	    cout<<" Number of iter:\t" << solver_control.last_step() << "\n";
+	    std::cout<<" Number of iter:\t" << solver_control.last_step() << "\n";
+#endif
     }
   }
 
@@ -676,9 +785,23 @@ double RightHandSide<dim>::value(const Point<dim> &p,
                   NonMatching::LocationToLevelSet::intersected;
       });
 
+#ifdef USE_TRILONOS
+    Vector<float> subdomain(triangulation.n_active_cells());
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+        subdomain(i) = triangulation.locally_owned_subdomain();
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    data_out.build_patches();
+
+    // have to create the directory output
+    data_out.write_vtu_with_pvtu_record(
+        output_dir, "solution", cycle, MPI_COMM_WORLD, 5, 1);
+#else    
     data_out.build_patches();
     std::ofstream output("step-Trace.vtu");
     data_out.write_vtu(output);
+
+#endif
   }
 
 
@@ -747,8 +870,9 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     double                        error_L2_squared = 0;
 
     for (const auto &cell :
-         dof_handler.active_cell_iterators() |
-           IteratorFilters::ActiveFEIndexEqualTo(ActiveFEIndex::lagrange))
+         dof_handler.active_cell_iterators() )
+      if(cell->is_locally_owned() &&
+         cell->active_fe_index() == ActiveFEIndex(lagrange))
       {
       
         non_matching_fe_values.reinit(cell);
@@ -759,7 +883,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
 
         if (fe_values)
           {
-            std::vector<double> solution_values(fe_values->n_quadrature_points);
+            std::VectorType solution_values(fe_values->n_quadrature_points);
             fe_values->get_function_values(solution, solution_values);
 
             for (const unsigned int q : fe_values->quadrature_point_indices())
@@ -794,7 +918,13 @@ double RightHandSide<dim>::value(const Point<dim> &p,
           }
       }
 
+#ifdef USE_TRILINOS
+    return std::sqrt(Utilities::MPI::sum(error_L2_squared,
+                             MPI_COMM_WORLD));
+
+#else
     return std::sqrt(error_L2_squared);
+#endif
   }
 
 
@@ -829,7 +959,11 @@ double RightHandSide<dim>::value(const Point<dim> &p,
           triangulation.begin_active()->minimum_vertex_distance();
 
         convergence_table.add_value("Cycle", cycle);
+#ifdef USE_TRILINOS
+        convergence_table.add_value("Mesh size", Utilities::MPI::min(cell_side_length, MPI_COMM_WORLD));
+#else        
         convergence_table.add_value("Mesh size", cell_side_length);
+#endif        
         convergence_table.add_value("L2-Error", error_L2);
 
         convergence_table.evaluate_convergence_rates(
@@ -837,7 +971,13 @@ double RightHandSide<dim>::value(const Point<dim> &p,
         convergence_table.set_scientific("L2-Error", true);
 
         std::cout << std::endl;
+#ifdef USE_TRILINOS
+        ConditionalOStream pcout(
+        std::cout, (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0));
+        convergence_table.write_text(pcout.get_stream());      
+#else        
         convergence_table.write_text(std::cout);
+#endif        
         std::cout << std::endl;
       }
   }
@@ -847,8 +987,13 @@ double RightHandSide<dim>::value(const Point<dim> &p,
 
 
 // @sect3{The main() function}
-int main()
+int main(int argc, char *argv[])
 {
+#ifdef USE_TRILINOS
+  using namespace dealii;
+  Utilities::MPI::MPI_InitFinalize mpi_initialization(
+    argc, argv, numbers::invalid_unsigned_int);
+#endif  
   const int dim = 3;
 
   StepTrace::LaplaceBeltramiSolver<dim> LB_solver;
