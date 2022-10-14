@@ -17,7 +17,7 @@
 // @sect3{Include files}
 
 // The first include files have all been treated in previous examples.
-// #define USE_TRILINOS
+#define USE_TRILINOS
 
 #include <deal.II/base/function.h>
 
@@ -41,6 +41,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/filtered_iterator.h>
 #include <deal.II/grid/tria.h>
+#include <deal.II/distributed/tria.h>
 
 #include <deal.II/hp/fe_collection.h>
 #include <deal.II/hp/q_collection.h>
@@ -134,7 +135,11 @@ namespace StepTrace
     const Functions::ConstantFunction<dim> rhs_function;
     const Functions::ConstantFunction<dim> boundary_condition;
 
+#ifdef USE_TRILINOS
+    parallel::distributed::Triangulation<dim> triangulation;
+#else
     Triangulation<dim> triangulation;
+#endif
 
     // We need two separate DoFHandlers. The first manages the DoFs for the
     // discrete level set function that describes the geometry of the domain.
@@ -153,6 +158,8 @@ namespace StepTrace
     SparsityPattern      sparsity_pattern;
     MatrixType stiffness_matrix;
     VectorType       rhs;
+
+    unsigned int number_of_iterations;
   };
 
 template <int dim>
@@ -171,30 +178,39 @@ double RightHandSide<dim>::value(const Point<dim> &p,
 }
 
 
-  template <int dim>
-  LaplaceBeltramiSolver<dim>::LaplaceBeltramiSolver()
-    : fe_degree(1)
-    , rhs_function(4.0)
-    , boundary_condition(1.0)
-    , fe_level_set(fe_degree)
-    , level_set_dof_handler(triangulation)
-    , dof_handler(triangulation)
-    , mesh_classifier(level_set_dof_handler, level_set)
-  {}
+template <int dim>
+LaplaceBeltramiSolver<dim>::LaplaceBeltramiSolver()
+  : fe_degree(1)
+  , rhs_function(4.0)
+  , boundary_condition(1.0)
+#ifdef USE_TRILINOS
+  , triangulation(MPI_COMM_WORLD,
+                  typename Triangulation<dim>::MeshSmoothing(
+                    Triangulation<dim>::smoothing_on_refinement |
+                    Triangulation<dim>::smoothing_on_coarsening),
+                  parallel::distributed::Triangulation<
+                    dim>::mesh_reconstruction_after_repartitioning)
+#endif
+  , fe_level_set(fe_degree)
+  , level_set_dof_handler(triangulation)
+  , dof_handler(triangulation)
+  , mesh_classifier(level_set_dof_handler, level_set)
+{}
 
 
 
-  // @sect3{Setting up the Background Mesh}
-  // We generate a background mesh with perfectly Cartesian cells. Our domain is
-  // a unit disc centered at the origin, so we need to make the background mesh
-  // a bit larger than $[-1, 1]^{\text{dim}}$ to completely cover $\Omega$.
-  template <int dim>
-  void LaplaceBeltramiSolver<dim>::make_grid()
-  {
-    std::cout << "Creating background mesh" << std::endl;
+// @sect3{Setting up the Background Mesh}
+// We generate a background mesh with perfectly Cartesian cells. Our domain is
+// a unit disc centered at the origin, so we need to make the background mesh
+// a bit larger than $[-1, 1]^{\text{dim}}$ to completely cover $\Omega$.
+template <int dim>
+void
+LaplaceBeltramiSolver<dim>::make_grid()
+{
+  std::cout << "Creating background mesh" << std::endl;
 
-    GridGenerator::hyper_cube(triangulation, -1.21, 1.21);
-    triangulation.refine_global(2);
+  GridGenerator::hyper_cube(triangulation, -1.21, 1.21);
+  triangulation.refine_global(2);
   }
 
 
@@ -262,8 +278,6 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     fe_collection.push_back(FE_Q<dim>(fe_degree));
     fe_collection.push_back(FE_Nothing<dim>());
 
-    std::cout<<" number of dofs: "<<dof_handler.n_dofs()<<std::endl;
-
     for (const auto &cell : dof_handler.active_cell_iterators())
       if(cell->is_locally_owned())
       {
@@ -282,6 +296,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
       }
 
     dof_handler.distribute_dofs(fe_collection);
+    std::cout<<" number of dofs: "<<dof_handler.n_dofs()<<std::endl;
   }
 
 
@@ -397,8 +412,8 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     Vector<double>     local_rhs(n_dofs_per_cell);
     std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
-    const double ghost_parameter   = 0;
-    const double norm_grad_parameter   = 0;
+    const double ghost_parameter   = 1;
+    const double norm_grad_parameter  = 0;
     const double nitsche_parameter = 5 * (fe_degree + 1) * fe_degree;
 
     // Since the ghost penalty is similar to a DG flux term, the simplest way to
@@ -689,8 +704,8 @@ double RightHandSide<dim>::value(const Point<dim> &p,
                   local_interface_dof_indices =
                     fe_interface_values.get_interface_dof_indices();
 
-                stiffness_matrix.add(local_interface_dof_indices,
-                                     local_stabilization);
+                // stiffness_matrix.add(local_interface_dof_indices,
+                //                      local_stabilization);
               }
         }
 #ifdef USE_TRILINOS        
@@ -704,7 +719,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
   template <int dim>
   void LaplaceBeltramiSolver<dim>::solve()
   {
-    std::string flag="nonDirect";
+    std::string flag="Direct";
     if (flag=="Direct")
     {	
     	std::cout << "Solving directly... ";
@@ -726,6 +741,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
     }
     else
      {
+      Timer timer;
 	    std::cout << "Solving system" << std::endl;
 #ifdef USE_TRILINOS
 	    const unsigned int max_iterations = solution.size();
@@ -743,11 +759,13 @@ double RightHandSide<dim>::value(const Point<dim> &p,
       Amg_data.higher_order_elements = false;
       Amg_data.smoother_sweeps       = 2;
       Amg_data.aggregation_threshold = 0.02;
+      Amg_data.output_details        = true;
       preconditioner_stiffness.initialize(stiffness_matrix);
 
       SolverCG<VectorType> cg(solver_control);
       cg.solve (stiffness_matrix, solution, rhs, preconditioner_stiffness);      
-      std::cout << "   Solving system... " << solver_control.last_step() <<" iterations."<< std::endl;      
+      std::cout << "   Solving system using AMG... " << solver_control.last_step() <<" iterations."<< std::endl;      
+      number_of_iterations = solver_control.last_step();
 
 #else
 	    const unsigned int max_iterations = solution.size();
@@ -758,6 +776,8 @@ double RightHandSide<dim>::value(const Point<dim> &p,
 	    solver.solve(stiffness_matrix, solution, rhs, ILU);
 	    std::cout<<" Number of iter:\t" << solver_control.last_step() << "\n";
 #endif
+	    timer.stop();
+	    std::cout << "took (" << timer.cpu_time() << "s)" << std::endl;
     }
   }
 
@@ -845,7 +865,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
   template <int dim>
   double LaplaceBeltramiSolver<dim>::compute_L2_error() const
   {
-    std::cout << "Computing L2 error" << std::endl;
+    std::cout << "Computing L2 error..." << std::endl;
 
     const QGauss<1> quadrature_1D(fe_degree + 1);
 
@@ -855,14 +875,15 @@ double RightHandSide<dim>::value(const Point<dim> &p,
         region_update_flags.surface = update_values | update_gradients |
                                   update_JxW_values | update_quadrature_points |
                                   update_normal_vectors;
-                                  
+
+
     NonMatching::FEValues<dim> non_matching_fe_values(fe_collection,
                                                       quadrature_1D,
                                                       region_update_flags,
                                                       mesh_classifier,
                                                       level_set_dof_handler,
                                                       level_set);
-
+// std::cout << "Computing L2 error...1..." << std::endl;
     // We then iterate iterate over the cells that have LocationToLevelSetValue
     // value inside or intersected again. For each quadrature point, we compute
     // the pointwise error and use this to compute the integral.
@@ -874,7 +895,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
       if(cell->is_locally_owned() &&
          cell->active_fe_index() == ActiveFEIndex(lagrange))
       {
-      
+      // std::cout << "Computing L2 error...2" << std::endl;
         non_matching_fe_values.reinit(cell);
         
         /*TraceFEM
@@ -914,17 +935,21 @@ double RightHandSide<dim>::value(const Point<dim> &p,
                 error_L2_squared +=
                   std::pow(error_at_point, 2) * surface_fe_values->JxW(q);
               }
-              
+              // std::cout<<" l2 error: "<< error_L2_squared << std::endl;
           }
       }
-
+// std::cout << "Computing L2 error...3" << std::endl;
 #ifdef USE_TRILINOS
-    return std::sqrt(Utilities::MPI::sum(error_L2_squared,
-                             MPI_COMM_WORLD));
+// std::cout<<" l2 error: "<< error_L2_squared << std::endl;
+    const double sum_global = Utilities::MPI::sum(error_L2_squared,
+                             MPI_COMM_WORLD);
+// std::cout << "Computing L2 error...4" << std::endl;                             
+    return std::sqrt(sum_global);
 
 #else
     return std::sqrt(error_L2_squared);
 #endif
+    std::cout<<" done!"<<std::endl;
   }
 
 
@@ -959,6 +984,7 @@ double RightHandSide<dim>::value(const Point<dim> &p,
           triangulation.begin_active()->minimum_vertex_distance();
 
         convergence_table.add_value("Cycle", cycle);
+        convergence_table.add_value("iterations", number_of_iterations);
 #ifdef USE_TRILINOS
         convergence_table.add_value("Mesh size", Utilities::MPI::min(cell_side_length, MPI_COMM_WORLD));
 #else        

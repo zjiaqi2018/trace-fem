@@ -3,7 +3,7 @@
 ##
 
 # Set the name of the project and target:
-SET(TARGET "step-10")
+SET(TARGET "step-Trace")
 
 # Declare all source files the target consists of. Here, this is only
 # the one step-X.cc file, but as you expand your project you may wish
@@ -23,7 +23,7 @@ SET(TARGET_SRC
 
 CMAKE_MINIMUM_REQUIRED(VERSION 3.3.0)
 
-FIND_PACKAGE(deal.II 9.5.0
+FIND_PACKAGE(deal.II 9.4.0
   HINTS ${deal.II_DIR} ${DEAL_II_DIR} ../ ../../ $ENV{DEAL_II_DIR}
   )
 IF(NOT ${deal.II_FOUND})
