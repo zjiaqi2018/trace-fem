@@ -41,6 +41,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/filtered_iterator.h>
 #include <deal.II/grid/tria.h>
+#include <deal.II/grid/grid_tools.h>
 #include <deal.II/distributed/tria.h>
 
 #include <deal.II/hp/fe_collection.h>
@@ -122,7 +123,7 @@ namespace StepTrace
 
     void solve();
 
-    void output_results() const;
+    void output_results(const unsigned int cycle) const;
 
     double compute_L2_error() const;
 
@@ -158,6 +159,9 @@ namespace StepTrace
     SparsityPattern      sparsity_pattern;
     MatrixType stiffness_matrix;
     VectorType       rhs;
+
+    AffineConstraints<double> constraints_level_set;
+    AffineConstraints<double> constraints;
 
     unsigned int number_of_iterations;
   };
@@ -226,6 +230,16 @@ LaplaceBeltramiSolver<dim>::make_grid()
     std::cout << "Setting up discrete level set function" << std::endl;
 
     level_set_dof_handler.distribute_dofs(fe_level_set);
+
+    constraints_level_set.clear();
+#ifdef USE_TRILINOS
+    constraints_level_set.reinit(level_set_dof_handler.locally_owned_dofs());
+#endif    
+
+    DoFTools::make_hanging_node_constraints(level_set_dof_handler,
+                                            constraints_level_set);
+
+    constraints_level_set.close();
 
     std::cout<<" level set number of dofs: "<<level_set_dof_handler.n_dofs()<<std::endl;
     const Functions::SignedDistance::Sphere<dim> signed_distance_sphere;    
@@ -330,7 +344,12 @@ LaplaceBeltramiSolver<dim>::make_grid()
     cell_coupling[0][0] = DoFTools::always;
     face_coupling[0][0] = DoFTools::always;
 
-    const AffineConstraints<double> constraints;
+    constraints.clear();
+#ifdef USE_TRILINOS
+    constraints.reinit(dof_handler.locally_owned_dofs());
+#endif
+    DoFTools::make_hanging_node_constraints(dof_handler, constraints);
+
     const bool                      keep_constrained_dofs = true;
 
     DoFTools::make_flux_sparsity_pattern(dof_handler,
@@ -377,8 +396,11 @@ LaplaceBeltramiSolver<dim>::make_grid()
     const NonMatching::LocationToLevelSet cell_location =
       mesh_classifier.location_to_level_set(cell);
 
-    const NonMatching::LocationToLevelSet neighbor_location =
-      mesh_classifier.location_to_level_set(cell->neighbor(face_index));
+    
+      const NonMatching::LocationToLevelSet neighbor_location =
+      cell->neighbor(face_index)->is_active()?
+        mesh_classifier.location_to_level_set(cell->neighbor(face_index)) :
+        NonMatching::LocationToLevelSet::unassigned;
 
 
 	/*TraceFEM: only internal to intersected
@@ -412,8 +434,8 @@ LaplaceBeltramiSolver<dim>::make_grid()
     Vector<double>     local_rhs(n_dofs_per_cell);
     std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
 
-    const double ghost_parameter   = 1;
-    const double norm_grad_parameter  = 0;
+    const double ghost_parameter   = 0;
+    const double norm_grad_parameter  = 20;
     const double nitsche_parameter = 5 * (fe_degree + 1) * fe_degree;
 
     // Since the ghost penalty is similar to a DG flux term, the simplest way to
@@ -719,7 +741,7 @@ LaplaceBeltramiSolver<dim>::make_grid()
   template <int dim>
   void LaplaceBeltramiSolver<dim>::solve()
   {
-    std::string flag="Direct";
+    std::string flag="nDirect";
     if (flag=="Direct")
     {	
     	std::cout << "Solving directly... ";
@@ -789,7 +811,7 @@ LaplaceBeltramiSolver<dim>::make_grid()
   // To disregard them, we write a small lambda function and use the
   // set_cell_selection function of the DataOut class.
   template <int dim>
-  void LaplaceBeltramiSolver<dim>::output_results() const
+  void LaplaceBeltramiSolver<dim>::output_results(const unsigned int cycle) const
   {
     std::cout << "Writing vtu file" << std::endl;
 
@@ -805,7 +827,7 @@ LaplaceBeltramiSolver<dim>::make_grid()
                   NonMatching::LocationToLevelSet::intersected;
       });
 
-#ifdef USE_TRILONOS
+#ifdef USE_TRILINOS
     Vector<float> subdomain(triangulation.n_active_cells());
     for (unsigned int i = 0; i < subdomain.size(); ++i)
         subdomain(i) = triangulation.locally_owned_subdomain();
@@ -815,7 +837,7 @@ LaplaceBeltramiSolver<dim>::make_grid()
 
     // have to create the directory output
     data_out.write_vtu_with_pvtu_record(
-        output_dir, "solution", cycle, MPI_COMM_WORLD, 5, 1);
+        "./", "solution", cycle, MPI_COMM_WORLD, 5, 1);
 #else    
     data_out.build_patches();
     std::ofstream output("step-Trace.vtu");
@@ -964,12 +986,40 @@ LaplaceBeltramiSolver<dim>::make_grid()
   {
     ConvergenceTable   convergence_table;
     const unsigned int n_refinements = 5;
+    double hmin = 0.;
 
     make_grid();
     for (unsigned int cycle = 0; cycle <= n_refinements; cycle++)
       {
         std::cout << "Refinement cycle " << cycle << std::endl;
-        triangulation.refine_global(1);
+        if(cycle == 0)
+          triangulation.refine_global(1);
+        else
+        {
+          level_set_dof_handler.distribute_dofs(fe_level_set);
+          setup_discrete_level_set();
+          mesh_classifier.reclassify();
+          // set refine flags
+          for (const auto &cell : level_set_dof_handler.active_cell_iterators())
+            if (cell->is_locally_owned())
+              {
+                const NonMatching::LocationToLevelSet cell_location =
+                  mesh_classifier.location_to_level_set(cell);
+
+                if (cell_location ==
+                    NonMatching::LocationToLevelSet::intersected)
+                    cell->set_refine_flag();
+              }
+          triangulation.execute_coarsening_and_refinement();
+          hmin = GridTools::minimal_cell_diameter(triangulation) /
+                              std::sqrt(1. * dim);
+          std::cout
+                << "   Number of active cells: "
+                << triangulation.n_active_cells() << std::endl
+                << "   Total number of cells: " << triangulation.n_cells()
+                << std::endl
+                << "hmin = " << hmin << std::endl;          
+        }
         setup_discrete_level_set();
         std::cout << "Classifying cells" << std::endl;
         mesh_classifier.reclassify();
@@ -977,12 +1027,11 @@ LaplaceBeltramiSolver<dim>::make_grid()
         initialize_matrices();
         assemble_system();
         solve();
-        if (cycle == n_refinements)
-          output_results();
+        // if (cycle == n_refinements)
+          output_results(cycle);
         const double error_L2 = compute_L2_error();
-        const double cell_side_length =
-          triangulation.begin_active()->minimum_vertex_distance();
-
+        const double cell_side_length = hmin;
+          
         convergence_table.add_value("Cycle", cycle);
         convergence_table.add_value("iterations", number_of_iterations);
 #ifdef USE_TRILINOS
