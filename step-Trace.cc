@@ -259,6 +259,7 @@ LaplaceBeltramiSolver<dim>::make_grid()
     level_set.reinit(level_set_locally_relevant_dofs,
                      level_set_dof_handler.locally_owned_dofs(),
                      MPI_COMM_WORLD);
+    constraints_level_set.distribute(tmp_sol);
     level_set = tmp_sol;
 
 #else
@@ -347,6 +348,19 @@ LaplaceBeltramiSolver<dim>::make_grid()
     constraints.clear();
 #ifdef USE_TRILINOS
     constraints.reinit(dof_handler.locally_owned_dofs());
+    {
+      // set one point to zero
+      const unsigned int n_dofs_per_cell = fe_collection[0].dofs_per_cell;
+      std::vector<types::global_dof_index> local_dof_indices(n_dofs_per_cell);
+      for (const auto &cell : dof_handler.active_cell_iterators())
+        if (cell->is_locally_owned() &&
+            cell->active_fe_index() == ActiveFEIndex::lagrange)
+          {
+            cell->get_dof_indices(local_dof_indices);
+            if(Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+              constraints.add_line(local_dof_indices[0]);            
+          }
+    }
 #endif
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
 
@@ -642,8 +656,8 @@ LaplaceBeltramiSolver<dim>::make_grid()
                                -normal * surface_fe_values->shape_grad(j, q) *
                                  surface_fe_values->shape_value(i, q) +
                                nitsche_parameter / cell_side_length * */
-                              surface_fe_values->shape_value(i, q) *
-                                surface_fe_values->shape_value(j, q) +
+                              // surface_fe_values->shape_value(i, q) *
+                              //   surface_fe_values->shape_value(j, q) +
                               (surface_fe_values->shape_grad(i, q) -
                                (normal * surface_fe_values->shape_grad(i, q)) *
                                  normal) *
@@ -673,8 +687,13 @@ LaplaceBeltramiSolver<dim>::make_grid()
 
           cell->get_dof_indices(local_dof_indices);
 
-          stiffness_matrix.add(local_dof_indices, local_stiffness);
-          rhs.add(local_dof_indices, local_rhs);
+          constraints.distribute_local_to_global(local_stiffness,
+                                                 local_rhs,
+                                                 local_dof_indices,
+                                                 stiffness_matrix,
+                                                 rhs);
+          // stiffness_matrix.add(local_dof_indices, local_stiffness);
+          // rhs.add(local_dof_indices, local_rhs);
 
 
           // The assembly of the ghost penalty term is straight forward. As we
@@ -726,8 +745,13 @@ LaplaceBeltramiSolver<dim>::make_grid()
                   local_interface_dof_indices =
                     fe_interface_values.get_interface_dof_indices();
 
+                constraints.distribute_local_to_global(
+                  local_stabilization,
+                  local_interface_dof_indices,
+                  stiffness_matrix);
                 // stiffness_matrix.add(local_interface_dof_indices,
                 //                      local_stabilization);
+                                     
               }
         }
 #ifdef USE_TRILINOS        
@@ -801,6 +825,8 @@ LaplaceBeltramiSolver<dim>::make_grid()
 	    timer.stop();
 	    std::cout << "took (" << timer.cpu_time() << "s)" << std::endl;
     }
+    constraints.distribute(solution);
+
   }
 
 
