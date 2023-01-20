@@ -233,7 +233,9 @@ LaplaceBeltramiSolver<dim>::make_grid()
 
     constraints_level_set.clear();
 #ifdef USE_TRILINOS
-    constraints_level_set.reinit(level_set_dof_handler.locally_owned_dofs());
+    IndexSet level_set_locally_relevant_dofs;
+    DoFTools::extract_locally_relevant_dofs(level_set_dof_handler, level_set_locally_relevant_dofs);
+    constraints_level_set.reinit(level_set_locally_relevant_dofs);
 #endif    
 
     DoFTools::make_hanging_node_constraints(level_set_dof_handler,
@@ -245,8 +247,6 @@ LaplaceBeltramiSolver<dim>::make_grid()
     const Functions::SignedDistance::Sphere<dim> signed_distance_sphere;    
 
 #ifdef USE_TRILINOS
-    IndexSet level_set_locally_relevant_dofs;
-    DoFTools::extract_locally_relevant_dofs(level_set_dof_handler, level_set_locally_relevant_dofs);
 
     VectorType tmp_sol;
     tmp_sol.reinit(level_set_dof_handler.locally_owned_dofs(),
@@ -346,7 +346,9 @@ LaplaceBeltramiSolver<dim>::make_grid()
 
     constraints.clear();
 #ifdef USE_TRILINOS
-    constraints.reinit(dof_handler.locally_owned_dofs());
+    IndexSet locally_relevant_dofs;
+    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
+    constraints.reinit(locally_relevant_dofs);
 #endif
     DoFTools::make_hanging_node_constraints(dof_handler, constraints);
 
@@ -361,8 +363,6 @@ LaplaceBeltramiSolver<dim>::make_grid()
                                          numbers::invalid_subdomain_id,
                                          face_has_flux_coupling);
 #ifdef USE_TRILINOS
-    IndexSet locally_relevant_dofs;
-    DoFTools::extract_locally_relevant_dofs(dof_handler, locally_relevant_dofs);
     IndexSet locally_owned_dofs = dof_handler.locally_owned_dofs();
     SparsityTools::distribute_sparsity_pattern(dsp,
                                                locally_owned_dofs,
